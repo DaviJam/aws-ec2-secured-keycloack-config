@@ -145,32 +145,6 @@ ${KEYCLOAK_DOMAIN} {
 EOF
 chown "$APP_USER":"$APP_USER" "${REPO_DIR}/Caddyfile"
 
-echo "[10/10] systemd unit for the stack..."
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=PhaseTwo Keycloak + Caddy stack (docker compose)
-Requires=docker.service
-After=docker.service
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-[Service]
-Type=oneshot
-WorkingDirectory=${REPO_DIR}
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose down
-RemainAfterExit=yes
-User=${APP_USER}
-Group=${APP_USER}
-TimeoutStartSec=420
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}.service"
-
 # Pre-pull images (non-fatal)
 sudo -u "$APP_USER" docker compose -f "${REPO_DIR}/docker-compose.yml" -f "${REPO_DIR}/docker-compose.override.yml" pull || true
 
