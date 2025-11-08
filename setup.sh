@@ -4,15 +4,10 @@ set -euo pipefail
 ### ========= CONFIG =========
 SAFE_USER="${SAFE_USER:-ubuntu}"                 # Rescue user kept untouched
 APP_USER="${APP_USER:-devops}"                   # Daily admin user
-TZ="${TZ:-Europe/Paris}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
 REPO_URL="${REPO_URL:-https://github.com/p2-inc/phasetwo-containers.git}"
 REPO_DIR="${REPO_DIR:-/opt/phasetwo-containers}"
 SERVICE_NAME="${SERVICE_NAME:-phasetwo-keycloak}"
-
-# SSH hardening (generally unnecessary on AWS; leave OFF)
-HARDEN_SSH="${HARDEN_SSH:-no}"
-CONFIRM_HARDENING="${CONFIRM_HARDENING:-no}"
 
 # Domains / ACME email for Caddy
 APP_DOMAIN="${APP_DOMAIN:-tronline.academy}"
@@ -23,7 +18,6 @@ ACME_EMAIL="${ACME_EMAIL:-admin@tronline.academy}"
 id -u "$SAFE_USER" >/dev/null 2>&1 || { echo "Rescue user $SAFE_USER not found."; exit 1; }
 
 echo "[1/10] System update & timezone..."
-timedatectl set-timezone "$TZ" || true
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 apt-get install -y ca-certificates curl gnupg lsb-release git jq unzip \
@@ -66,78 +60,6 @@ echo "[4/10] Node.js ${NODE_MAJOR}.x (for helper tools/app dev)..."
 curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
 apt-get install -y nodejs
 npm i -g pnpm@latest yarn@latest || true
-
-### (Optional) SSH hardening — OFF by default on AWS (use SGs/NACLs)
-#echo "[5/10] SSH hardening check..."
-APP_AUTH_KEYS="/home/${APP_USER}/.ssh/authorized_keys"
-#if [ "${HARDEN_SSH}" = "yes" ] && [ "${CONFIRM_HARDENING}" = "yes" ] && [ -s "$APP_AUTH_KEYS" ]; then
-#  SSHD_CFG="/etc/ssh/sshd_config"
-#  cp -a "$SSHD_CFG" "${SSHD_CFG}.bak.$(date +%s)" || true
-#  grep -q '^PubkeyAuthentication' "$SSHD_CFG" || echo 'PubkeyAuthentication yes' >> "$SSHD_CFG"
-#  if grep -q '^PasswordAuthentication' "$SSHD_CFG"; then
-#    sed -i 's/^PasswordAuthentication .*/PasswordAuthentication no/' "$SSHD_CFG"
-#  else
-#    echo 'PasswordAuthentication no' >> "$SSHD_CFG"
-#  fi
-#  if grep -q '^PermitRootLogin' "$SSHD_CFG"; then
-#    sed -i 's/^PermitRootLogin .*/PermitRootLogin prohibit-password/' "$SSHD_CFG"
-#  else
-#    echo 'PermitRootLogin prohibit-password' >> "$SSHD_CFG"
-#  fi
-#  sshd -t
-#  systemctl reload ssh || systemctl restart ssh
-#  echo "  -> SSH hardened (key-only)."
-#else
-#  echo "  -> SSH hardening skipped (recommend AWS Security Groups instead)."
-#fi
-
-echo "[6/10] CloudWatch Agent (metrics/logs to AWS)..."
-# Requires the instance to have IAM role with CloudWatchAgentServerPolicy
-CW_DEB="/tmp/amazon-cloudwatch-agent.deb"
-curl -fsSL -o "$CW_DEB" https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i "$CW_DEB"
-rm -f "$CW_DEB"
-
-cat >/opt/aws/amazon-cloudwatch-agent.json <<'CWCFG'
-{
-  "agent": {
-    "metrics_collection_interval": 60,
-    "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
-    "run_as_user": "root"
-  },
-  "metrics": {
-    "append_dimensions": {
-      "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
-      "InstanceId": "${aws:InstanceId}",
-      "InstanceType": "${aws:InstanceType}"
-    },
-    "metrics_collected": {
-      "cpu":   { "measurement": ["cpu_usage_idle","cpu_usage_iowait","cpu_usage_system","cpu_usage_user"], "totalcpu": true },
-      "disk":  { "measurement": ["used_percent"], "resources": ["*"] },
-      "diskio":{ "measurement": ["io_time","write_bytes","read_bytes"] },
-      "mem":   { "measurement": ["mem_used_percent","mem_available","mem_used"] },
-      "net":   { "measurement": ["bytes_sent","bytes_recv","packets_sent","packets_recv"], "resources": ["*"] },
-      "swap":  { "measurement": ["swap_used_percent"] },
-      "procstat": [
-        { "pattern": "caddy" },
-        { "pattern": "keycloak" }
-      ]
-    }
-  },
-  "logs": {
-    "logs_collected": {
-      "files": {
-        "collect_list": [
-          { "file_path": "/var/log/syslog", "log_group_name": "/ec2/syslog", "log_stream_name": "{instance_id}", "timestamp_format": "%b %d %H:%M:%S" }
-        ]
-      }
-    }
-  }
-}
-CWCFG
-
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop || true
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent.json
 
 echo "[7/10] Clone/update PhaseTwo containers repo..."
 mkdir -p "$(dirname "$REPO_DIR")"
@@ -259,6 +181,4 @@ echo "Status:        systemctl status ${SERVICE_NAME}.service"
 echo ""
 echo "Rescue user kept: ${SAFE_USER}"
 echo "Admin user:       ${APP_USER} (passwordless sudo configured)"
-echo "SSH hardening:    HARDEN_SSH=${HARDEN_SSH}, CONFIRM_HARDENING=${CONFIRM_HARDENING}"
-echo "CloudWatch Agent: installed & started (requires IAM role: CloudWatchAgentServerPolicy)"
 echo "============================================================"
