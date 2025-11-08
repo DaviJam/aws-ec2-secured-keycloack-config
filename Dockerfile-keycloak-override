@@ -2,34 +2,33 @@
 FROM maven:3.9-eclipse-temurin-21 AS mvn
 WORKDIR /src
 
-# copy only what we need for libs build (better cache)
+# Copy only libs for better cache usage
 COPY libs /src/libs
 
-# build the modules that produce jars used by the container
-# -pl selects modules; -am also builds their deps
+# Build modules that produce providers (skip tests)
 RUN mvn -f libs/pom.xml -B -DskipTests -am -pl bundle,internal package
+
+# Gather every produced jar into a single directory
+RUN mkdir -p /out/providers \
+ && find /src/libs -type f -path "*/target/*" -name "*.jar" -exec cp -v {} /out/providers/ \; || true
 
 # ---------- Stage 1: prepare Keycloak with providers ----------
 FROM quay.io/phasetwo/keycloak-crdb:26.4.2 AS builder
 
-ENV KC_METRICS_ENABLED=true
-ENV KC_HEALTH_ENABLED=true
-ENV KC_FEATURES=preview
+ENV KC_METRICS_ENABLED=true \
+    KC_HEALTH_ENABLED=true \
+    KC_FEATURES=preview
 
 # Infinispan jdbc_ping config
-COPY ./conf/cache-ispn-jdbc-ping.xml /opt/keycloak/conf/cache-ispn-jdbc-ping.xml
+COPY conf/cache-ispn-jdbc-ping.xml /opt/keycloak/conf/cache-ispn-jdbc-ping.xml
 
-# 3rd-party providers (from repo)
-COPY ./libs/ext/*.jar /opt/keycloak/providers/
+# 3rd-party providers from repo
+COPY libs/ext/*.jar /opt/keycloak/providers/
 
-# Providers built in Stage 0 (support both flat and nested target layouts)
-# bundle jars (e.g., libs/bundle/target/bundle-*/*.jar or directly under target)
-COPY --from=mvn /src/libs/bundle/target/*.jar /opt/keycloak/providers/
-COPY --from=mvn /src/libs/bundle/target/*/*.jar /opt/keycloak/providers/
-# internal jars (if the module produces any providers)
-COPY --from=mvn /src/libs/internal/target/*.jar /opt/keycloak/providers/ || true
+# Providers built in Stage 0 (single copy; works even if directory is empty)
+COPY --from=mvn /out/providers/ /opt/keycloak/providers/
 
-# Pre-build for faster startup (same flags as your runtime)
+# Pre-build to optimize startup
 RUN /opt/keycloak/bin/kc.sh --verbose build \
     --spi-email-template-provider=freemarker-plus-mustache \
     --spi-email-template-freemarker-plus-mustache-enabled=true \
@@ -41,9 +40,6 @@ FROM quay.io/phasetwo/keycloak-crdb:26.4.2
 USER 1000
 WORKDIR /opt/keycloak
 
-# bring over built artifacts and config
 COPY --from=builder /opt/keycloak/lib/quarkus/ /opt/keycloak/lib/quarkus/
 COPY --from=builder /opt/keycloak/providers/ /opt/keycloak/providers/
 COPY --from=builder /opt/keycloak/conf/cache-ispn-jdbc-ping.xml /opt/keycloak/conf/cache-ispn-jdbc-ping.xml
-
-# entrypoint is set by compose (kc.sh start with your flags)
