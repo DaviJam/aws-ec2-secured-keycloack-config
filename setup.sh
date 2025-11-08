@@ -3,20 +3,18 @@ set -euo pipefail
 
 ### ========= CONFIG =========
 SAFE_USER="${SAFE_USER:-ubuntu}"                 # Rescue user kept untouched
-APP_USER="${APP_USER:-devops}"                   # Daily admin user to create/use
+APP_USER="${APP_USER:-devops}"                   # Daily admin user
 TZ="${TZ:-Europe/Paris}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
 REPO_URL="${REPO_URL:-https://github.com/p2-inc/phasetwo-containers.git}"
 REPO_DIR="${REPO_DIR:-/opt/phasetwo-containers}"
 SERVICE_NAME="${SERVICE_NAME:-phasetwo-keycloak}"
 
-# Security toggles
-OPEN_HTTP="${OPEN_HTTP:-yes}"                    # open 80/443 in UFW
-ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-yes}"
-HARDEN_SSH="${HARDEN_SSH:-yes}"                  # policy, gated by CONFIRM_HARDENING
-CONFIRM_HARDENING="${CONFIRM_HARDENING:-no}"     # must be "yes" to touch sshd
+# SSH hardening (generally unnecessary on AWS; leave OFF)
+HARDEN_SSH="${HARDEN_SSH:-no}"
+CONFIRM_HARDENING="${CONFIRM_HARDENING:-no}"
 
-# Domains / ACME email
+# Domains / ACME email for Caddy
 APP_DOMAIN="${APP_DOMAIN:-tronline.academy}"
 KEYCLOAK_DOMAIN="${KEYCLOAK_DOMAIN:-auth.tronline.academy}"
 ACME_EMAIL="${ACME_EMAIL:-admin@tronline.academy}"
@@ -24,17 +22,15 @@ ACME_EMAIL="${ACME_EMAIL:-admin@tronline.academy}"
 ### ========= PRECHECKS =========
 id -u "$SAFE_USER" >/dev/null 2>&1 || { echo "Rescue user $SAFE_USER not found."; exit 1; }
 
-echo "[1/12] System update & timezone..."
+echo "[1/10] System update & timezone..."
 timedatectl set-timezone "$TZ" || true
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-
-echo "[2/12] Base packages..."
-apt-get install -y ca-certificates curl gnupg lsb-release git ufw jq unzip \
+apt-get install -y ca-certificates curl gnupg lsb-release git jq unzip \
   build-essential software-properties-common unattended-upgrades
 dpkg-reconfigure -f noninteractive unattended-upgrades || true
 
-echo "[3/12] Docker Engine + Compose plugin..."
+echo "[2/10] Docker Engine + Compose plugin..."
 install -m 0755 -d /etc/apt/keyrings
 if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -48,13 +44,11 @@ apt-get update -y
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
 
-echo "[4/12] Create/prepare admin user '${APP_USER}' (keep '${SAFE_USER}' as rescue)..."
+echo "[3/10] Create admin user '${APP_USER}' (keep '${SAFE_USER}' as rescue)..."
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
   adduser --disabled-password --gecos "" "$APP_USER"
 fi
 usermod -aG sudo,docker "$APP_USER" || true
-
-# SSH key for APP_USER: copy from SAFE_USER if present
 mkdir -p "/home/${APP_USER}/.ssh"
 if [ -s "/home/${SAFE_USER}/.ssh/authorized_keys" ]; then
   cp "/home/${SAFE_USER}/.ssh/authorized_keys" "/home/${APP_USER}/.ssh/" || true
@@ -63,88 +57,89 @@ chown -R "${APP_USER}:${APP_USER}" "/home/${APP_USER}/.ssh"
 chmod 700 "/home/${APP_USER}/.ssh"
 [ -f "/home/${APP_USER}/.ssh/authorized_keys" ] && chmod 600 "/home/${APP_USER}/.ssh/authorized_keys"
 
-# Passwordless sudo for APP_USER (drop-in file, validated, correct perms)
-echo "[4b/12] Configure passwordless sudo for '${APP_USER}'..."
+echo "[3b/10] Configure passwordless sudo for '${APP_USER}'..."
 echo "${APP_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-${APP_USER}"
 chmod 440 "/etc/sudoers.d/90-${APP_USER}"
 visudo -cf "/etc/sudoers.d/90-${APP_USER}"
 
-echo "[5/12] Node.js ${NODE_MAJOR}.x..."
+echo "[4/10] Node.js ${NODE_MAJOR}.x (for helper tools/app dev)..."
 curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
 apt-get install -y nodejs
-npm i -g pnpm@latest yarn@latest pm2@latest || true
+npm i -g pnpm@latest yarn@latest || true
 
-### -------- Stage UFW rules (enable later) --------
-echo "[6/12] UFW rule staging (not enabling yet)..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-
-# Detect SSH port and public IP
-SSH_PORT="$(ss -tnlp 2>/dev/null | awk '/sshd/ && /LISTEN/ {print $4}' | sed -n 's/.*:\([0-9]\+\)$/\1/p' | head -n1 || true)"
-[ -z "${SSH_PORT:-}" ] && SSH_PORT=22
-PUB_IP="$(curl -4s https://ifconfig.me || curl -4s https://api.ipify.org || true)"
-
-# Allow OpenSSH and explicit port; whitelist current IP
-ufw app list 2>/dev/null | grep -q "OpenSSH" && ufw allow OpenSSH
-ufw allow "${SSH_PORT}"/tcp
-[ -n "$PUB_IP" ] && ufw allow from "$PUB_IP" to any port "${SSH_PORT}" proto tcp
-[ "$OPEN_HTTP" = "yes" ] && ufw allow 80/tcp && ufw allow 443/tcp
-
-### -------- Fail2ban with ignoreip --------
-echo "[7/12] Fail2ban..."
-if [ "$ENABLE_FAIL2BAN" = "yes" ]; then
-  apt-get install -y fail2ban
-  IGNORE_IPS="127.0.0.1/8"
-  [ -n "$PUB_IP" ] && IGNORE_IPS="$IGNORE_IPS $PUB_IP"
-  cat >/etc/fail2ban/jail.local <<JAIL
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 6
-backend  = systemd
-banaction = iptables-multiport
-ignoreip = ${IGNORE_IPS}
-
-[sshd]
-enabled = true
-port    = ssh
-logpath = %(sshd_log)s
-JAIL
-  systemctl enable --now fail2ban
-else
-  echo "  -> fail2ban not installed."
-fi
-
-### -------- SSH hardening (explicitly confirmed only) --------
-echo "[8/12] SSH hardening (only if CONFIRM_HARDENING=yes and ${APP_USER} has authorized_keys)..."
+### (Optional) SSH hardening — OFF by default on AWS (use SGs/NACLs)
+#echo "[5/10] SSH hardening check..."
 APP_AUTH_KEYS="/home/${APP_USER}/.ssh/authorized_keys"
-if [ "$HARDEN_SSH" = "yes" ] && [ "$CONFIRM_HARDENING" = "yes" ] && [ -s "$APP_AUTH_KEYS" ]; then
-  SSHD_CFG="/etc/ssh/sshd_config"
-  cp -a "$SSHD_CFG" "${SSHD_CFG}.bak.$(date +%s)" || true
+#if [ "${HARDEN_SSH}" = "yes" ] && [ "${CONFIRM_HARDENING}" = "yes" ] && [ -s "$APP_AUTH_KEYS" ]; then
+#  SSHD_CFG="/etc/ssh/sshd_config"
+#  cp -a "$SSHD_CFG" "${SSHD_CFG}.bak.$(date +%s)" || true
+#  grep -q '^PubkeyAuthentication' "$SSHD_CFG" || echo 'PubkeyAuthentication yes' >> "$SSHD_CFG"
+#  if grep -q '^PasswordAuthentication' "$SSHD_CFG"; then
+#    sed -i 's/^PasswordAuthentication .*/PasswordAuthentication no/' "$SSHD_CFG"
+#  else
+#    echo 'PasswordAuthentication no' >> "$SSHD_CFG"
+#  fi
+#  if grep -q '^PermitRootLogin' "$SSHD_CFG"; then
+#    sed -i 's/^PermitRootLogin .*/PermitRootLogin prohibit-password/' "$SSHD_CFG"
+#  else
+#    echo 'PermitRootLogin prohibit-password' >> "$SSHD_CFG"
+#  fi
+#  sshd -t
+#  systemctl reload ssh || systemctl restart ssh
+#  echo "  -> SSH hardened (key-only)."
+#else
+#  echo "  -> SSH hardening skipped (recommend AWS Security Groups instead)."
+#fi
 
-  # Safe global hardening; keep rescue usability
-  if grep -q '^PasswordAuthentication' "$SSHD_CFG"; then
-    sed -i 's/^PasswordAuthentication .*/PasswordAuthentication no/' "$SSHD_CFG"
-  else
-    echo 'PasswordAuthentication no' >> "$SSHD_CFG"
-  fi
-  if grep -q '^PermitRootLogin' "$SSHD_CFG"; then
-    sed -i 's/^PermitRootLogin .*/PermitRootLogin prohibit-password/' "$SSHD_CFG"
-  else
-    echo 'PermitRootLogin prohibit-password' >> "$SSHD_CFG"
-  fi
-  grep -q '^PubkeyAuthentication yes' "$SSHD_CFG" || echo 'PubkeyAuthentication yes' >> "$SSHD_CFG"
+echo "[6/10] CloudWatch Agent (metrics/logs to AWS)..."
+# Requires the instance to have IAM role with CloudWatchAgentServerPolicy
+CW_DEB="/tmp/amazon-cloudwatch-agent.deb"
+curl -fsSL -o "$CW_DEB" https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i "$CW_DEB"
+rm -f "$CW_DEB"
 
-  sshd -t
-  systemctl reload ssh || systemctl restart ssh
-  echo "  -> SSH hardened (password auth disabled; root via key only)."
-else
-  echo "  -> Skipped SSH hardening."
-fi
+cat >/opt/aws/amazon-cloudwatch-agent.json <<'CWCFG'
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log",
+    "run_as_user": "root"
+  },
+  "metrics": {
+    "append_dimensions": {
+      "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+      "InstanceId": "${aws:InstanceId}",
+      "InstanceType": "${aws:InstanceType}"
+    },
+    "metrics_collected": {
+      "cpu":   { "measurement": ["cpu_usage_idle","cpu_usage_iowait","cpu_usage_system","cpu_usage_user"], "totalcpu": true },
+      "disk":  { "measurement": ["used_percent"], "resources": ["*"] },
+      "diskio":{ "measurement": ["io_time","write_bytes","read_bytes"] },
+      "mem":   { "measurement": ["mem_used_percent","mem_available","mem_used"] },
+      "net":   { "measurement": ["bytes_sent","bytes_recv","packets_sent","packets_recv"], "resources": ["*"] },
+      "swap":  { "measurement": ["swap_used_percent"] },
+      "procstat": [
+        { "pattern": "caddy" },
+        { "pattern": "keycloak" }
+      ]
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          { "file_path": "/var/log/syslog", "log_group_name": "/ec2/syslog", "log_stream_name": "{instance_id}", "timestamp_format": "%b %d %H:%M:%S" }
+        ]
+      }
+    }
+  }
+}
+CWCFG
 
-### -------- Clone + Caddy/Compose files --------
-echo "[9/12] Clone/update PhaseTwo containers..."
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop || true
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent.json
+
+echo "[7/10] Clone/update PhaseTwo containers repo..."
 mkdir -p "$(dirname "$REPO_DIR")"
 if [ -d "$REPO_DIR/.git" ]; then
   git -C "$REPO_DIR" fetch --all --prune
@@ -155,7 +150,7 @@ else
 fi
 chown -R "$APP_USER":"$APP_USER" "$REPO_DIR"
 
-echo "[10/12] Write docker-compose.override.yml (Caddy + App + network overrides)..."
+echo "[8/10] Write docker-compose.override.yml (Caddy + App + network overrides)..."
 cat > "${REPO_DIR}/docker-compose.override.yml" <<'EOF'
 networks:
   web:
@@ -205,7 +200,7 @@ services:
 EOF
 chown "$APP_USER":"$APP_USER" "${REPO_DIR}/docker-compose.override.yml"
 
-echo "[11/12] Write Caddyfile..."
+echo "[9/10] Write Caddyfile..."
 cat > "${REPO_DIR}/Caddyfile" <<EOF
 {
   email ${ACME_EMAIL}
@@ -228,7 +223,7 @@ ${KEYCLOAK_DOMAIN} {
 EOF
 chown "$APP_USER":"$APP_USER" "${REPO_DIR}/Caddyfile"
 
-echo "[12/12] Create/refresh systemd unit: ${SERVICE_NAME}.service"
+echo "[10/10] systemd unit for the stack..."
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=PhaseTwo Keycloak + Caddy stack (docker compose)
@@ -257,17 +252,13 @@ systemctl enable "${SERVICE_NAME}.service"
 # Pre-pull images (non-fatal)
 sudo -u "$APP_USER" docker compose -f "${REPO_DIR}/docker-compose.yml" -f "${REPO_DIR}/docker-compose.override.yml" pull || true
 
-### -------- Enable UFW LAST --------
-echo "[FINAL] Enabling UFW..."
-ufw --force enable
-ufw status verbose || true
-
 echo "============================================================"
 echo "Done."
 echo "Start stack:   sudo systemctl start ${SERVICE_NAME}.service"
 echo "Status:        systemctl status ${SERVICE_NAME}.service"
+echo ""
 echo "Rescue user kept: ${SAFE_USER}"
-echo "Admin user:       ${APP_USER}"
-echo "SSH hardening applied? HARDEN_SSH=${HARDEN_SSH}, CONFIRM_HARDENING=${CONFIRM_HARDENING}"
-echo "Detected SSH port: ${SSH_PORT}  | Your IP: ${PUB_IP:-unknown}"
+echo "Admin user:       ${APP_USER} (passwordless sudo configured)"
+echo "SSH hardening:    HARDEN_SSH=${HARDEN_SSH}, CONFIRM_HARDENING=${CONFIRM_HARDENING}"
+echo "CloudWatch Agent: installed & started (requires IAM role: CloudWatchAgentServerPolicy)"
 echo "============================================================"
